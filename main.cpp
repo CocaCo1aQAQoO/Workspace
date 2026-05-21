@@ -19,6 +19,7 @@
 #include "rc_math.h"
 #include "led_driver.h"
 #include "ultrasonic.h"
+#include "bmp280.h"
 
 // --- 全局配置参数 ---
 const float LOOP_TIME_SEC = 0.01f;      // 目标循环时间 10ms (100Hz) 
@@ -29,11 +30,12 @@ const char* GS_IP = "192.168.1.100";    // 未来替换为你的电脑 IP
 const int GS_PORT = 8888;               // FastAPI 监听的端口
 
 // 简单的 UDP 发送工具函数
-void send_telemetry(int sock, struct sockaddr_in& addr, float pitch, float roll, float yaw) {
-    // 构造 JSON 格式数据传回遥控端可视化显示 [cite: 22]
+void send_telemetry(int sock, struct sockaddr_in& addr, float pitch, float roll, float yaw, float alt, float temp) {
     std::string msg = "{\"pitch\":" + std::to_string(pitch) + 
                       ",\"roll\":" + std::to_string(roll) + 
-                      ",\"yaw\":" + std::to_string(yaw) + "}";
+                      ",\"yaw\":" + std::to_string(yaw) + 
+                      ",\"alt\":" + std::to_string(alt) + 
+                      ",\"temp\":" + std::to_string(temp) + "}";
     sendto(sock, msg.c_str(), msg.length(), 0, (struct sockaddr*)&addr, sizeof(addr));
 }
 
@@ -58,10 +60,18 @@ int main() {
         std::cerr << "警告: 超声波模块初始化失败！" << std::endl;
     }
 
+    // 👇 新增：初始化气压计 (通常和 MPU6050 挂在同一个 I2C 总线上)
+    BMP280 barometer;
+    if (!barometer.init("/dev/i2c-1")) {
+        std::cerr << "警告: 气压计初始化失败！" << std::endl;
+    }
+
     // 2. 初始化 PID 控制器 (参数需实地试飞调参)
     PIDController roll_pid(1.2f, 0.05f, 0.3f, 50.0f);
     PIDController pitch_pid(1.2f, 0.05f, 0.3f, 50.0f);
     PIDController yaw_pid(2.5f, 0.0f, 0.0f, 50.0f);
+    PIDController alt_pid(15.0f, 0.1f, 5.0f, 200.0f); 
+    float target_altitude = 1.0f;
 
     // 3. 初始化 UDP 网络 Socket
     int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -113,6 +123,17 @@ int main() {
             status_led.set_state(DroneState::ARMED_FLYING);
         }
 
+        // 👇 新增：气压计定高逻辑
+        float current_alt = barometer.get_relative_altitude();
+        float current_temp = 0.0f; // 占位，稍后传给地面站
+        barometer.read_sensor_data(current_temp, current_alt); // 获取真实温度
+        
+        // 只有当遥控器油门推到中间悬停区时，才介入自动定高
+        if (base_throttle > 300.0f && base_throttle < 600.0f) {
+            float throttle_adjust = alt_pid.update(target_altitude, current_alt, LOOP_TIME_SEC);
+            base_throttle += throttle_adjust; // 自动推拉油门
+        }
+
         // --- D. PID 闭环控制计算 --- [cite: 17]
         float roll_out  = roll_pid.update(target_roll, imu.roll, LOOP_TIME_SEC);
         float pitch_out = pitch_pid.update(target_pitch, imu.pitch, LOOP_TIME_SEC);
@@ -134,7 +155,7 @@ int main() {
         // set_motor_pwm(motor1, motor2, motor3, motor4);
 
         // --- F. 地面站遥测数据发送 ---
-        send_telemetry(udp_sock, gs_addr, imu.pitch, imu.roll, imu.yaw);
+        send_telemetry(udp_sock, gs_addr, imu.pitch, imu.roll, imu.yaw, current_alt, current_temp);
 
         // --- G. 严格时钟同步 ---
         // 如果当前时间早于期望时间，就休眠剩下的时间；如果超时则直接进入下一轮
