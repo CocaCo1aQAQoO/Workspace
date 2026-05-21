@@ -20,6 +20,7 @@
 #include "led_driver.h"
 #include "ultrasonic.h"
 #include "bmp280.h"
+#include "dht11.h"
 
 // --- 全局配置参数 ---
 const float LOOP_TIME_SEC = 0.01f;      // 目标循环时间 10ms (100Hz) 
@@ -30,12 +31,13 @@ const char* GS_IP = "192.168.1.100";    // 未来替换为你的电脑 IP
 const int GS_PORT = 8888;               // FastAPI 监听的端口
 
 // 简单的 UDP 发送工具函数
-void send_telemetry(int sock, struct sockaddr_in& addr, float pitch, float roll, float yaw, float alt, float temp) {
+void send_telemetry(int sock, struct sockaddr_in& addr, float pitch, float roll, float yaw, float alt, float temp, float humi) {
     std::string msg = "{\"pitch\":" + std::to_string(pitch) + 
                       ",\"roll\":" + std::to_string(roll) + 
                       ",\"yaw\":" + std::to_string(yaw) + 
                       ",\"alt\":" + std::to_string(alt) + 
-                      ",\"temp\":" + std::to_string(temp) + "}";
+                      ",\"temp\":" + std::to_string(temp) + 
+                      ",\"humi\":" + std::to_string(humi) + "}";
     sendto(sock, msg.c_str(), msg.length(), 0, (struct sockaddr*)&addr, sizeof(addr));
 }
 
@@ -65,6 +67,16 @@ int main() {
     if (!barometer.init("/dev/i2c-1")) {
         std::cerr << "警告: 气压计初始化失败！" << std::endl;
     }
+
+    DHT11 dht_sensor(19);
+    if (!dht_sensor.init()) {
+        std::cerr << "警告: DHT11 初始化失败！" << std::endl;
+    }
+
+    // 👇 新增：用于限制 DHT11 读取频率的定时器和全局数据
+    auto last_dht_time = std::chrono::steady_clock::now();
+    float current_humidity = 0.0f; 
+    // 注意：BMP280 测温度比 DHT11 准得多，所以温度我们依然用气压计传回来的 current_temp
 
     // 2. 初始化 PID 控制器 (参数需实地试飞调参)
     PIDController roll_pid(1.2f, 0.05f, 0.3f, 50.0f);
@@ -123,10 +135,11 @@ int main() {
             status_led.set_state(DroneState::ARMED_FLYING);
         }
 
-        // 👇 新增：气压计定高逻辑
+        // 👇 修复后的气压计定高逻辑
         float current_alt = barometer.get_relative_altitude();
-        float current_temp = 0.0f; // 占位，稍后传给地面站
-        barometer.read_sensor_data(current_temp, current_alt); // 获取真实温度
+        float current_temp = 0.0f;
+        float current_press = 0.0f; // 新增一个专门用来接气压的变量
+        barometer.read_sensor_data(current_temp, current_press); // 这样 current_alt 就安全了
         
         // 只有当遥控器油门推到中间悬停区时，才介入自动定高
         if (base_throttle > 300.0f && base_throttle < 600.0f) {
@@ -154,8 +167,19 @@ int main() {
         // TODO: 调用底层 PWM 驱动输出给电调 (硬件连线后编写)
         // set_motor_pwm(motor1, motor2, motor3, motor4);
 
+        // 👇 新增：每 2 秒读取一次温湿度，绝不阻塞主控制环！
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_dht_time).count() >= 2) {
+            float temp_h, temp_t;
+            if (dht_sensor.read_data(temp_h, temp_t)) {
+                current_humidity = temp_h;
+                // 如果需要，也可以把 temp_t 打印出来对比 BMP280 的温度
+            }
+            last_dht_time = now;
+        }
+
         // --- F. 地面站遥测数据发送 ---
-        send_telemetry(udp_sock, gs_addr, imu.pitch, imu.roll, imu.yaw, current_alt, current_temp);
+        send_telemetry(udp_sock, gs_addr, imu.pitch, imu.roll, imu.yaw, current_alt, current_temp, current_humidity);
 
         // --- G. 严格时钟同步 ---
         // 如果当前时间早于期望时间，就休眠剩下的时间；如果超时则直接进入下一轮
