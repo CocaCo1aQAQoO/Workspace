@@ -1,6 +1,6 @@
 /**
  * 基于 Milk-V Duo 的 RISC-V 飞控系统主程序
- * 硬件平台: Milk-V Duo 256 (主控) [cite: 9]
+ * 硬件平台: Milk-V Duo 256 (主控)
  * 核心功能: 姿态解算、闭环 PID 控制、UDP 遥测数据回传
  */
 
@@ -22,12 +22,14 @@
 #include "bmp280.h"
 #include "dht11.h"
 #include "logger.h"
+#include "buzzer.h"
+#include "adc_battery.h"
 
 // --- 全局配置参数 ---
 const float LOOP_TIME_SEC = 0.01f;      // 目标循环时间 10ms (100Hz) 
-const float LOW_BATT_THRESHOLD = 3.2f;  // 低电压报警阈值 3.2V [cite: 21]
+const float LOW_BATT_THRESHOLD = 3.2f;  // 低电压报警阈值 3.2V
 
-// --- 地面站 UDP 配置 ---
+// --- 地站 UDP 配置 ---
 const char* GS_IP = "192.168.1.100";    // 未来替换为你的电脑 IP
 const int GS_PORT = 8888;               // FastAPI 监听的端口
 
@@ -57,13 +59,11 @@ int main() {
         status_led.set_state(DroneState::ERROR);
     }
 
-    // 👇 新增：初始化超声波外设 (假设 Trig=17, Echo=18)
     Ultrasonic front_sonar(17, 18);
     if (!front_sonar.init()) {
         std::cerr << "警告: 超声波模块初始化失败！" << std::endl;
     }
 
-    // 👇 新增：初始化气压计 (通常和 MPU6050 挂在同一个 I2C 总线上)
     BMP280 barometer;
     if (!barometer.init("/dev/i2c-1")) {
         std::cerr << "警告: 气压计初始化失败！" << std::endl;
@@ -74,10 +74,20 @@ int main() {
         std::cerr << "警告: DHT11 初始化失败！" << std::endl;
     }
 
-    // 👇 新增：用于限制 DHT11 读取频率的定时器和全局数据
+    // 👇 新增：初始化蜂鸣器和电压检测模块
+    Buzzer drone_buzzer(20);
+    if (!drone_buzzer.init()) {
+        std::cerr << "警告: 蜂鸣器驱动初始化失败！" << std::endl;
+    }
+
+    AdcBattery battery_sensor(1, 3.3f, 5.0f); // 1号ADC，基准3.3V，分压比5.0
+    if (!battery_sensor.init()) {
+        std::cerr << "警告: ADC电压检测节点初始化失败！" << std::endl;
+    }
+
+    // 用于限制 DHT11 读取频率的定时器和全局数据
     auto last_dht_time = std::chrono::steady_clock::now();
     float current_humidity = 0.0f; 
-    // 注意：BMP280 测温度比 DHT11 准得多，所以温度我们依然用气压计传回来的 current_temp
 
     // 2. 初始化 PID 控制器 (参数需实地试飞调参)
     PIDController roll_pid(1.2f, 0.05f, 0.3f, 50.0f);
@@ -93,7 +103,7 @@ int main() {
     gs_addr.sin_port = htons(GS_PORT);
     inet_pton(AF_INET, GS_IP, &gs_addr.sin_addr);
 
-    // 👇 新增：初始化黑匣子 (文件将保存在 Milk-V Duo 的当前运行目录下)
+    // 初始化黑匣子 (文件将保存在 Milk-V Duo 的当前运行目录下)
     DataLogger blackbox;
     if (!blackbox.init("flight_log.csv")) {
         std::cerr << "警告: 黑匣子 SD 卡文件创建失败！" << std::endl;
@@ -122,33 +132,45 @@ int main() {
         float raw_yaw_stick   = 0.0f;
         float base_throttle   = 400.0f; // 基础油门
 
-        // 进行死区和指数曲线(Expo)处理 [cite: 18]
+        // 进行死区和指数曲线(Expo)处理
         float target_roll  = RCMath::process_channel(raw_roll_stick, 0.05f, 0.6f) * 30.0f; // 最大倾角30度
         float target_pitch = RCMath::process_channel(raw_pitch_stick, 0.05f, 0.6f) * 30.0f;
         float target_yaw   = RCMath::process_channel(raw_yaw_stick, 0.05f, 0.6f) * 45.0f;
 
-        // 👇 新增：超声波避障逻辑拦截
+        // 超声波避障逻辑拦截
         float distance = front_sonar.get_distance_m();
         if (distance > 0.0f && distance < 1.0f) { 
             // 发现前方 1 米内有障碍物，无视遥控器推杆，强行给一个向后的目标角度进行刹车
             target_pitch = -15.0f; 
         }
         
-        // --- C. 系统状态机与安全逻辑 ---
-        float battery_voltage = 3.8f; // 未来替换为真实的 ADC 读取
-        if (battery_voltage < LOW_BATT_THRESHOLD) {
+        // 👇 修改：C. 系统状态机与安全逻辑 (接入真实电池读数与蜂鸣器)
+        float battery_voltage = battery_sensor.read_voltage(); 
+        
+        // 防御策略：电压 <= 2.0V 认为是 USB 供电调试，不报警，状态为 STANDBY
+        if (battery_voltage <= 2.0f) {
+            status_led.set_state(DroneState::STANDBY);
+            drone_buzzer.set(false);
+        } 
+        // 低压保护触发
+        else if (battery_voltage < LOW_BATT_THRESHOLD) {
             status_led.set_state(DroneState::LOW_BATTERY);
-            // 触发低压保护：主动缓慢降低基础油门 [cite: 21]
+            drone_buzzer.set(true); // 📢 触发物理蜂鸣器尖叫！
+            
+            // 触发低压保护：主动缓慢降低基础油门
             base_throttle *= 0.8f; 
-        } else {
+        } 
+        // 正常带电状态
+        else {
             status_led.set_state(DroneState::ARMED_FLYING);
+            drone_buzzer.set(false); // 闭嘴
         }
 
-        // 👇 修复后的气压计定高逻辑
+        // 修复后的气压计定高逻辑
         float current_alt = barometer.get_relative_altitude();
         float current_temp = 0.0f;
-        float current_press = 0.0f; // 新增一个专门用来接气压的变量
-        barometer.read_sensor_data(current_temp, current_press); // 这样 current_alt 就安全了
+        float current_press = 0.0f; 
+        barometer.read_sensor_data(current_temp, current_press); 
         
         // 只有当遥控器油门推到中间悬停区时，才介入自动定高
         if (base_throttle > 300.0f && base_throttle < 600.0f) {
@@ -156,7 +178,7 @@ int main() {
             base_throttle += throttle_adjust; // 自动推拉油门
         }
 
-        // --- D. PID 闭环控制计算 --- [cite: 17]
+        // --- D. PID 闭环控制计算 ---
         float roll_out  = roll_pid.update(target_roll, imu.roll, LOOP_TIME_SEC);
         float pitch_out = pitch_pid.update(target_pitch, imu.pitch, LOOP_TIME_SEC);
         float yaw_out   = yaw_pid.update(target_yaw, imu.yaw, LOOP_TIME_SEC);
@@ -176,13 +198,12 @@ int main() {
         // TODO: 调用底层 PWM 驱动输出给电调 (硬件连线后编写)
         // set_motor_pwm(motor1, motor2, motor3, motor4);
 
-        // 👇 新增：每 2 秒读取一次温湿度，绝不阻塞主控制环！
+        // 每 2 秒读取一次温湿度，绝不阻塞主控制环！
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_dht_time).count() >= 2) {
             float temp_h, temp_t;
             if (dht_sensor.read_data(temp_h, temp_t)) {
                 current_humidity = temp_h;
-                // 如果需要，也可以把 temp_t 打印出来对比 BMP280 的温度
             }
             last_dht_time = now;
         }
@@ -190,10 +211,10 @@ int main() {
         // --- F. 地面站遥测数据发送 ---
         send_telemetry(udp_sock, gs_addr, imu.pitch, imu.roll, imu.yaw, current_alt, current_temp, current_humidity);
 
-        // 👇 新增：计算当前飞行时间，并写入黑匣子
+        // 计算当前飞行时间，并写入黑匣子
         float flight_time = std::chrono::duration_cast<std::chrono::milliseconds>(now - system_start_time).count() / 1000.0f;
         blackbox.log_frame(flight_time, imu.pitch, imu.roll, imu.yaw, current_alt, motor1, motor2, motor3, motor4);
-        
+
         // --- G. 严格时钟同步 ---
         // 如果当前时间早于期望时间，就休眠剩下的时间；如果超时则直接进入下一轮
         std::this_thread::sleep_until(next_loop_time);
