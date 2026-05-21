@@ -21,6 +21,7 @@
 #include "ultrasonic.h"
 #include "bmp280.h"
 #include "dht11.h"
+#include "logger.h"
 
 // --- 全局配置参数 ---
 const float LOOP_TIME_SEC = 0.01f;      // 目标循环时间 10ms (100Hz) 
@@ -91,6 +92,14 @@ int main() {
     gs_addr.sin_family = AF_INET;
     gs_addr.sin_port = htons(GS_PORT);
     inet_pton(AF_INET, GS_IP, &gs_addr.sin_addr);
+
+    // 👇 新增：初始化黑匣子 (文件将保存在 Milk-V Duo 的当前运行目录下)
+    DataLogger blackbox;
+    if (!blackbox.init("flight_log.csv")) {
+        std::cerr << "警告: 黑匣子 SD 卡文件创建失败！" << std::endl;
+    }
+    // 记录系统启动的零点时间，用于生成时间戳
+    auto system_start_time = std::chrono::steady_clock::now();
 
     std::cout << "系统初始化完成，进入 100Hz 控制主循环..." << std::endl;
     status_led.set_state(DroneState::STANDBY);
@@ -181,6 +190,10 @@ int main() {
         // --- F. 地面站遥测数据发送 ---
         send_telemetry(udp_sock, gs_addr, imu.pitch, imu.roll, imu.yaw, current_alt, current_temp, current_humidity);
 
+        // 👇 新增：计算当前飞行时间，并写入黑匣子
+        float flight_time = std::chrono::duration_cast<std::chrono::milliseconds>(now - system_start_time).count() / 1000.0f;
+        blackbox.log_frame(flight_time, imu.pitch, imu.roll, imu.yaw, current_alt, motor1, motor2, motor3, motor4);
+        
         // --- G. 严格时钟同步 ---
         // 如果当前时间早于期望时间，就休眠剩下的时间；如果超时则直接进入下一轮
         std::this_thread::sleep_until(next_loop_time);
