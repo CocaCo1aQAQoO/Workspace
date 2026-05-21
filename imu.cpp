@@ -14,7 +14,6 @@
 
 IMUSensor::IMUSensor() {
     pitch = 0.0f; roll = 0.0f; yaw = 0.0f;
-    alpha = 0.98f; // 信任 98% 陀螺仪，2% 加速度计
     // 这些零偏数据必须等你的硬件到了之后，平放测出来再填进去！
     gyro_x_offset = 0.0f; 
     gyro_y_offset = 0.0f; 
@@ -71,10 +70,10 @@ void IMUSensor::update(float dt) {
     float acc_roll  = atan2(acc_y, acc_z) * 180.0 / M_PI;
     float acc_pitch = atan2(-acc_x, sqrt(acc_y*acc_y + acc_z*acc_z)) * 180.0 / M_PI;
 
-    // 4. 【核心作业要求】互补滤波算法融合
-    // 公式：新角度 = 0.98 * (旧角度 + 陀螺仪角速度 * dt) + 0.02 * 加速度计绝对角度
-    roll  = alpha * (roll + gyro_x * dt) + (1.0f - alpha) * acc_roll;
-    pitch = alpha * (pitch + gyro_y * dt) + (1.0f - alpha) * acc_pitch;
+    // 4. 👇 【核心升级】卡尔曼滤波数据融合
+    // 传入：加速度计观测角度、陀螺仪角速度、时间差
+    roll  = kalman_roll.get_angle(acc_roll, gyro_x, dt);
+    pitch = kalman_pitch.get_angle(acc_pitch, gyro_y, dt);
     
     // 注意：偏航角 (Yaw) 通常无法通过加速度计补偿（因为重力垂直于 Z 轴），只能靠陀螺仪硬积分，或引入磁力计
     // yaw = yaw + gyro_z * dt; 

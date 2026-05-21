@@ -1,6 +1,8 @@
 #ifndef IMU_SENSOR_H
 #define IMU_SENSOR_H
 
+#include "kalman.h"
+
 class IMUSensor {
 private:
     int i2c_fd;             // I2C 设备文件描述符
@@ -8,8 +10,9 @@ private:
     float gyro_y_offset;
     float gyro_z_offset;
 
-    // 互补滤波的参数 (通常取 0.98 左右)
-    float alpha;            
+    // 👇 替换核心：移除互补滤波的 alpha，改为两个独立的单轴卡尔曼滤波器
+    KalmanFilter kalman_roll;
+    KalmanFilter kalman_pitch;    
 
     // 内部寄存器读取函数
     short read_raw_data(int addr);
