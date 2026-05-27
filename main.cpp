@@ -22,7 +22,7 @@ int main() {
     flightLed.setYellow(); // 🟡 亮黄灯：代表系统正在进行自检
 
     // 1. 初始化姿态传感器
-    MS6DSV imu("/dev/i2c-3", 0x6b);
+    MS6DSV imu("/dev/i2c-3", 0x6a);
     if (!imu.init()) {
         std::cerr << "错误: MS6DSV 初始化失败！" << std::endl;
         return -1;

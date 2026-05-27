@@ -22,7 +22,7 @@ bool MS6DSV::init() {
         return false;
     }
 
-    // 2. 绑定设备地址 (0x6b)
+    // 2. 绑定设备地址 (0x6a)
     if (ioctl(file_fd, I2C_SLAVE, dev_addr) < 0) {
         std::cerr << "Failed to acquire bus access and/or talk to slave." << std::endl;
         return false;
