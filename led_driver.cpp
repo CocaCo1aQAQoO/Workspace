@@ -1,83 +1,108 @@
-
 #include "led_driver.h"
-#include <fstream>
 #include <iostream>
-#include <unistd.h> // 提供 usleep 延时函数
+#include <fstream>
+#include <unistd.h>
+#include <cstdlib>
+#include <dirent.h> // 🌟 引入 C++ 原生目录扫描库
 
-RGBLed::RGBLed(int r, int g, int b) : pin_r(r), pin_g(g), pin_b(b) {}
+StatusLED::StatusLED() : pinR(-1), pinG(-1), pinB(-1), isInitialized(false) {}
 
-// 将 GPIO 编号导出到用户空间
-bool RGBLed::export_gpio(int pin) {
-    std::ofstream export_file("/sys/class/gpio/export");
-    if (!export_file.is_open()) return false;
-    export_file << pin;
-    export_file.close();
-    return true;
+StatusLED::~StatusLED() {
+    if (isInitialized) {
+        setOff(); 
+    }
 }
 
-// 设置 GPIO 为输出模式 (out)
-bool RGBLed::set_direction(int pin, const std::string& dir) {
-    std::string path = "/sys/class/gpio/gpio" + std::to_string(pin) + "/direction";
-    std::ofstream dir_file(path);
-    if (!dir_file.is_open()) return false;
-    dir_file << dir;
-    dir_file.close();
-    return true;
-}
+// 🌟 核心升级 1：放弃脆弱的 Shell 命令，使用 C++ 原生扫描内核目录寻找基址
+int StatusLED::findGpioABase() {
+    // 强制复用引脚打开大门
+    system("duo-pinmux -w GP16/GP16 >/dev/null 2>&1");
+    system("duo-pinmux -w GP17/GP17 >/dev/null 2>&1");
+    system("duo-pinmux -w GP18/GP18 >/dev/null 2>&1");
 
-// 设置 GPIO 高低电平 (1 或 0)
-bool RGBLed::set_value(int pin, int value) {
-    std::string path = "/sys/class/gpio/gpio" + std::to_string(pin) + "/value";
-    std::ofstream val_file(path);
-    if (!val_file.is_open()) return false;
-    val_file << value;
-    val_file.close();
-    return true;
-}
-
-bool RGBLed::init() {
-    int pins[] = {pin_r, pin_g, pin_b};
-    for (int pin : pins) {
-        export_gpio(pin);
-        // 系统导出 GPIO 需要极短的时间，稍微延时一下防止找不到文件
-        usleep(50000); 
-        if (!set_direction(pin, "out")) {
-            std::cerr << "LED 初始化失败: 无法设置引脚 " << pin << " 为输出模式" << std::endl;
-            return false;
+    DIR *dir;
+    struct dirent *ent;
+    // 扫描 /sys/class/gpio/ 目录
+    if ((dir = opendir("/sys/class/gpio")) != NULL) {
+        while ((ent = readdir(dir)) != NULL) {
+            std::string dirName = ent->d_name;
+            // 找到包含 "gpiochip" 的文件夹
+            if (dirName.find("gpiochip") != std::string::npos) {
+                std::string labelPath = "/sys/class/gpio/" + dirName + "/label";
+                std::ifstream labelFile(labelPath);
+                if (labelFile.is_open()) {
+                    std::string label;
+                    labelFile >> label;
+                    // 如果文件内容包含 3020000 (GPIOA 的硬件地址)
+                    if (label.find("3020000") != std::string::npos) {
+                        std::string numStr = dirName.substr(8); // 提取 "gpiochip" 后面的数字
+                        closedir(dir);
+                        return std::stoi(numStr);
+                    }
+                }
+            }
         }
-        set_value(pin, 0); // 初始状态全灭
+        closedir(dir);
     }
+    return -1;
+}
+
+// 🌟 核心升级 2：修复换行符，确保 Sysfs 写入被内核确认
+void StatusLED::writeToFile(const std::string& path, const std::string& value) {
+    std::ofstream file(path);
+    if (file.is_open()) {
+        file << value << std::endl; // std::endl 包含换行并强制刷新缓冲区！
+        file.close();
+    }
+}
+
+void StatusLED::exportPin(int pin) {
+    // 🌟 核心升级 3：听你的！先清除缓存（强制注销）
+    writeToFile("/sys/class/gpio/unexport", std::to_string(pin));
+    usleep(20000); // 给内核 20 毫秒的时间释放之前的僵尸进程
+
+    // 重新干净地初始化
+    writeToFile("/sys/class/gpio/export", std::to_string(pin));
+    usleep(50000); // 必须延时，等待内核创建好全新的 value 和 direction 节点
+
+    // 重新强行设为输出模式
+    writeToFile("/sys/class/gpio/gpio" + std::to_string(pin) + "/direction", "out");
+}
+
+bool StatusLED::init() {
+    int baseAddr = findGpioABase();
+    if (baseAddr == -1) {
+        std::cerr << "[LED 驱动] ❌ 严重错误：无法找到 GPIOA 基址！" << std::endl;
+        return false;
+    }
+
+    pinR = baseAddr + 23;
+    pinG = baseAddr + 24;
+    pinB = baseAddr + 22;
+
+    std::cout << "[LED 驱动] ✅ 缓存已清除！成功接管引脚: R=" << pinR << ", G=" << pinG << ", B=" << pinB << std::endl;
+
+    exportPin(pinR);
+    exportPin(pinG);
+    exportPin(pinB);
+    
+    isInitialized = true;
+    setOff();
     return true;
 }
 
-RGBLed::~RGBLed() {
-    // 程序退出时熄灭所有灯
-    set_color(0, 0, 0);
-    // 严谨的做法是写入 /sys/class/gpio/unexport 释放引脚，这里为了代码简洁略去
+void StatusLED::setColor(int r, int g, int b) {
+    if (!isInitialized) return;
+    writeToFile("/sys/class/gpio/gpio" + std::to_string(pinR) + "/value", std::to_string(r));
+    writeToFile("/sys/class/gpio/gpio" + std::to_string(pinG) + "/value", std::to_string(g));
+    writeToFile("/sys/class/gpio/gpio" + std::to_string(pinB) + "/value", std::to_string(b));
 }
 
-void RGBLed::set_color(int r_val, int g_val, int b_val) {
-    set_value(pin_r, r_val);
-    set_value(pin_g, g_val);
-    set_value(pin_b, b_val);
-}
-
-void RGBLed::set_state(DroneState state) {
-    switch (state) {
-        case DroneState::BOOTING:
-            set_color(1, 1, 0); // 红+绿=黄
-            break;
-        case DroneState::STANDBY:
-            set_color(0, 1, 0); // 绿灯
-            break;
-        case DroneState::ARMED_FLYING:
-            set_color(0, 0, 1); // 蓝灯
-            break;
-        case DroneState::LOW_BATTERY:
-            set_color(1, 0, 0); // 红灯
-            break;
-        case DroneState::ERROR:
-            set_color(1, 0, 0); // 红灯
-            break;
-    }
-}
+void StatusLED::setRed()    { setColor(1, 0, 0); }
+void StatusLED::setGreen()  { setColor(0, 1, 0); }
+void StatusLED::setBlue()   { setColor(0, 0, 1); }
+void StatusLED::setYellow() { setColor(1, 1, 0); }
+void StatusLED::setPurple() { setColor(1, 0, 1); }
+void StatusLED::setCyan()   { setColor(0, 1, 1); }
+void StatusLED::setWhite()  { setColor(1, 1, 1); }
+void StatusLED::setOff()    { setColor(0, 0, 0); }
