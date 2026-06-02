@@ -66,9 +66,30 @@ int main() {
     bool is_alt_hold = false;
     float hover_throttle = 0.0f;
     float target_alt = 0.0f;
-    uint16_t last_rx_throttle = 1000;
-    int failsafe_counter = 0;
 
+    // ==========================================
+    // 🌟 脱机飞行核心：开机待机监听锁
+    std::cout << ">>> 硬件底层就绪！等待遥控器 SWA (CH5) 拨下以唤醒飞控..." << std::endl;
+    flightLed.setYellow(); // 黄灯常亮代表“通电待机中”
+
+    while (true) {
+        // 清空串口积压并读取最新通道数据
+        for (int i = 0; i < 3; i++) receiver.update(); 
+        uint16_t rx_arm_switch = receiver.get_channel(5);
+
+        // 如果侦测到 SWA 拨杆被拨下 (富斯遥控器拨下通常输出 2000)
+        if (rx_arm_switch > 1500) {
+            break; // 💥 冲破待机锁，进入下方真实的校准和飞行控制流！
+        }
+
+        // 待机期间，持续喂给电调 1000us 的最低信号，防止电调超时哔哔报警
+        esc1.setThrottle(1000); esc2.setThrottle(1000);
+        esc3.setThrottle(1000); esc4.setThrottle(1000);
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    // ==========================================
+    
     std::cout << ">>> 正在校准，请保持飞机绝对水平静止..." << std::endl;
     float gyro_x_offset = 0.0f, gyro_y_offset = 0.0f, gyro_z_offset = 0.0f;
     float accel_roll_offset = 0.0f, accel_pitch_offset = 0.0f;
@@ -109,7 +130,7 @@ int main() {
         float temp = 0.0f, press = 0.0f, alt = 0.0f;
         barometer.read_sensor(temp, press, alt);
         // ==========================================
-        
+
         // 连读排空缓冲区，消除延迟
         for (int i = 0; i < 3; i++) receiver.update(); 
         
@@ -152,16 +173,9 @@ int main() {
         float estimated_pitch = kalman_pitch.get_angle(accel_pitch, gyro_y, LOOP_TIME_SEC);
         estimated_yaw += gyro_z * LOOP_TIME_SEC; 
 
-        // 🌟 核心 1：失控保护 (Failsafe) 侦测
-        // 如果数字接收机断开，信号通常会完全冻结。我们检测油门是否在 0.5 秒内绝对静止。
-        if (rx_throttle == last_rx_throttle) {
-            failsafe_counter++;
-        } else {
-            failsafe_counter = 0;
-            last_rx_throttle = rx_throttle;
-        }
-        // 如果冻结超过 50 个循环(0.5秒) 或者 收到异常低值，判定为失控！
-        bool is_failsafe = (failsafe_counter > 50) || (rx_throttle < 900);
+        // 🌟 核心修正：真正的失控保护 (Failsafe)
+        // 正常最低油门是 1000。只有遥控器关机、信号丢失或接收机断线时，值才会跌至 950 以下。
+        bool is_failsafe = (rx_throttle < 950);
 
         // 🌟 核心 2：定高悬停 (Altitude Hold) 逻辑
         float pid_out_alt = 0.0f;
