@@ -9,6 +9,7 @@
 #include "led_driver.h"
 #include "pid.h"
 #include "pwm_esc.h" 
+#include "bmp280.h"
 
 const float LOOP_TIME_SEC = 0.01f;
 const float RAD_TO_DEG = 57.29577951f;
@@ -26,6 +27,13 @@ int main() {
         return -1;
     }
     KalmanFilter kalman_roll, kalman_pitch;
+
+    BMP280 barometer("/dev/i2c-3", 0x76);
+    if (!barometer.init()) {
+        std::cerr << "警告: 气压计初始化失败！" << std::endl;
+    } else {
+        std::cout << ">>> BMP 气压计初始化成功！" << std::endl;
+    }
 
     IBus receiver;
     if (!receiver.init("/dev/ttyS1")) {
@@ -176,6 +184,16 @@ int main() {
             esc4.setThrottle(clamp_pwm(out4));
         }
 
+        // 🌟 新增：读取气压计并降频打印测试
+        float temp = 0.0f, press = 0.0f, alt = 0.0f;
+        barometer.read_sensor(temp, press, alt);
+
+        static int count = 0;
+        if (count++ % 10 == 0) { // 每 10 个循环（即每 0.1 秒）打印一次，防止刷屏卡顿
+            std::cout << "高度: " << alt << " 米 | 气压: " << press << " Pa | 温度: " << temp << " °C" << std::endl;
+        }
+        // ==========================================
+        
         std::this_thread::sleep_until(next_loop_time);
     }
     return 0;
