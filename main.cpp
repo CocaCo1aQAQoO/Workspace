@@ -58,6 +58,16 @@ int main() {
     PIDController pid_roll(1.2f, 0.0f, 0.6f, 50.0f);
     PIDController pid_pitch(1.2f, 0.0f, 0.6f, 50.0f);
     PIDController pid_yaw(2.0f, 0.0f, 0.0f, 50.0f);
+    
+    // 🌟 新增：Z轴高度 PID 控制器 (用于定高)
+    PIDController pid_alt(20.0f, 0.0f, 15.0f, 100.0f); 
+
+    // 🌟 新增：定高与失控保护的状态变量
+    bool is_alt_hold = false;
+    float hover_throttle = 0.0f;
+    float target_alt = 0.0f;
+    uint16_t last_rx_throttle = 1000;
+    int failsafe_counter = 0;
 
     std::cout << ">>> 正在校准，请保持飞机绝对水平静止..." << std::endl;
     float gyro_x_offset = 0.0f, gyro_y_offset = 0.0f, gyro_z_offset = 0.0f;
@@ -93,6 +103,13 @@ int main() {
     while (true) {
         next_loop_time += std::chrono::milliseconds(10);
 
+        
+        // ==========================================
+        // 读取气压计数据 (需放在前面以供 PID 使用)
+        float temp = 0.0f, press = 0.0f, alt = 0.0f;
+        barometer.read_sensor(temp, press, alt);
+        // ==========================================
+        
         // 连读排空缓冲区，消除延迟
         for (int i = 0; i < 3; i++) receiver.update(); 
         
@@ -135,6 +152,33 @@ int main() {
         float estimated_pitch = kalman_pitch.get_angle(accel_pitch, gyro_y, LOOP_TIME_SEC);
         estimated_yaw += gyro_z * LOOP_TIME_SEC; 
 
+        // 🌟 核心 1：失控保护 (Failsafe) 侦测
+        // 如果数字接收机断开，信号通常会完全冻结。我们检测油门是否在 0.5 秒内绝对静止。
+        if (rx_throttle == last_rx_throttle) {
+            failsafe_counter++;
+        } else {
+            failsafe_counter = 0;
+            last_rx_throttle = rx_throttle;
+        }
+        // 如果冻结超过 50 个循环(0.5秒) 或者 收到异常低值，判定为失控！
+        bool is_failsafe = (failsafe_counter > 50) || (rx_throttle < 900);
+
+        // 🌟 核心 2：定高悬停 (Altitude Hold) 逻辑
+        float pid_out_alt = 0.0f;
+        // 设定油门中位死区 (1450~1550)。如果你把右手摇杆放在中间，飞机自动接管高度！
+        if (rx_throttle > 1450 && rx_throttle < 1550 && is_armed && base_throttle > 100.0f) {
+            if (!is_alt_hold) {
+                target_alt = alt; // 瞬间锁定当前气压高度
+                hover_throttle = base_throttle; // 锁定你当前的物理推力
+                is_alt_hold = true;
+            }
+            pid_out_alt = pid_alt.update(target_alt, alt, LOOP_TIME_SEC);
+            base_throttle = hover_throttle + pid_out_alt; // PID 接管油门
+        } else {
+            is_alt_hold = false;
+            pid_alt.reset(); // 退出定高时，清空历史误差积分
+        }
+
         float target_roll = stick_roll * 30.0f;
         float target_pitch = stick_pitch * 30.0f;
         
@@ -149,24 +193,32 @@ int main() {
         float pid_out_pitch = pid_pitch.update(target_pitch, estimated_pitch, LOOP_TIME_SEC);
         float pid_out_yaw   = pid_yaw.update(target_yaw, estimated_yaw, LOOP_TIME_SEC);
 
-        // 坠机保护阈值：真实飞行设定为 75 度物理极限
         if (std::abs(estimated_roll) > 75.0f || std::abs(estimated_pitch) > 75.0f) {
             is_crashed = true;
         } 
         
-        if (is_crashed) {
+        // 🚨 优先级 0：失控保护 (最高绝对指令)
+        if (is_failsafe) {
+            flightLed.setRed(); // 红灯长亮代表失控
+            // TODO: 未来可在此处实现 "缓慢迫降" 逻辑。当前为了安全，直接停转。
+            esc1.setThrottle(1000); esc2.setThrottle(1000);
+            esc3.setThrottle(1000); esc4.setThrottle(1000);
+        }
+        // 🚨 优先级 1：坠机锁死
+        else if (is_crashed) {
             flightLed.setRed();      
             esc1.setThrottle(1000); esc2.setThrottle(1000);
             esc3.setThrottle(1000); esc4.setThrottle(1000);
         } 
+        // 🔵 优先级 2：安全上锁 / 怠速防误触
         else if (!is_armed || base_throttle < 10.0f) {
             flightLed.setBlue();     
             esc1.setThrottle(1000); esc2.setThrottle(1000);
             esc3.setThrottle(1000); esc4.setThrottle(1000);
         } 
+        // 🟢 优先级 3：正常战斗飞行 (激活外旋混控)
         else {
             flightLed.setGreen(); 
-            // 🌟 外旋 (Props Out) 混控矩阵
             float out1 = 1000.0f + base_throttle - pid_out_pitch + pid_out_roll + pid_out_yaw;
             float out2 = 1000.0f + base_throttle - pid_out_pitch - pid_out_roll - pid_out_yaw;
             float out3 = 1000.0f + base_throttle + pid_out_pitch + pid_out_roll - pid_out_yaw;
@@ -184,16 +236,17 @@ int main() {
             esc4.setThrottle(clamp_pwm(out4));
         }
 
-        // 🌟 新增：读取气压计并降频打印测试
-        float temp = 0.0f, press = 0.0f, alt = 0.0f;
-        barometer.read_sensor(temp, press, alt);
-
+        // 📝 默认状态输出 (每 0.1 秒刷新一次，干净、专业)
         static int count = 0;
-        if (count++ % 10 == 0) { // 每 10 个循环（即每 0.1 秒）打印一次，防止刷屏卡顿
-            std::cout << "高度: " << alt << " 米 | 气压: " << press << " Pa | 温度: " << temp << " °C" << std::endl;
+        if (count++ % 10 == 0) { 
+            std::cout << (is_failsafe ? "[⚠️ 失控]" : (is_crashed ? "[❌ 坠机]" : (is_armed ? "[🚀 战斗]" : "[🔒 安全]")))
+                      << (is_alt_hold ? " [定高 ON] " : " [定高 OFF]")
+                      << " 油门: " << (int)base_throttle 
+                      << " | 高度: " << alt << "m"
+                      << " | 倾角(R/P): " << (int)estimated_roll << "°," << (int)estimated_pitch << "°" 
+                      << std::endl;
         }
-        // ==========================================
-        
+
         std::this_thread::sleep_until(next_loop_time);
     }
     return 0;
