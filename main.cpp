@@ -89,7 +89,7 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     // ==========================================
-    
+
     std::cout << ">>> 正在校准，请保持飞机绝对水平静止..." << std::endl;
     float gyro_x_offset = 0.0f, gyro_y_offset = 0.0f, gyro_z_offset = 0.0f;
     float accel_roll_offset = 0.0f, accel_pitch_offset = 0.0f;
@@ -207,9 +207,16 @@ int main() {
         float pid_out_pitch = pid_pitch.update(target_pitch, estimated_pitch, LOOP_TIME_SEC);
         float pid_out_yaw   = pid_yaw.update(target_yaw, estimated_yaw, LOOP_TIME_SEC);
 
+        // 🌟 核心修正：加入容错防抖，过滤 I2C 噪声导致的“瞬间假坠机”
+        static int crash_counter = 0;
         if (std::abs(estimated_roll) > 75.0f || std::abs(estimated_pitch) > 75.0f) {
-            is_crashed = true;
-        } 
+            crash_counter++;
+            if (crash_counter > 25) { // 必须连续 0.25 秒(25帧)超过 75 度，才判定为物理坠机！
+                is_crashed = true;
+            }
+        } else {
+            crash_counter = 0; // 一旦恢复正常姿态，计数器立刻清零，化险为夷
+        }
         
         // 🚨 优先级 0：失控保护 (最高绝对指令)
         if (is_failsafe) {
