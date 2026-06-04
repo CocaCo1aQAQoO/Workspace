@@ -11,11 +11,15 @@
 #include "pwm_esc.h" 
 #include "bmp280.h"
 
+// 🌟 新增：引入你的黑匣子和数学库
+#include "logger.h"
+#include "rc_math.h"
+
 const float LOOP_TIME_SEC = 0.01f;
 const float RAD_TO_DEG = 57.29577951f;
 
 int main() {
-    std::cout << "=== 🚀 极简飞控 V1.0 (实战飞行版: 外旋 + 死区 + Airmode) ===" << std::endl;
+    std::cout << "=== 🚀 极简飞控 V1.0 (实战飞行版: 外旋 + Expo + 黑匣子) ===" << std::endl;
 
     StatusLED flightLed;
     flightLed.init();
@@ -54,15 +58,23 @@ int main() {
     esc1.setThrottle(1000); esc2.setThrottle(1000);
     esc3.setThrottle(1000); esc4.setThrottle(1000);
 
+    // 🌟 新增：初始化黑匣子记录器
+    DataLogger flight_logger;
+    if (flight_logger.init("/root/flight_log.csv")) {
+        std::cout << ">>> 黑匣子 (Logger) 初始化成功！数据将写入 /root/flight_log.csv" << std::endl;
+    } else {
+        std::cerr << "警告: 黑匣子初始化失败！" << std::endl;
+    }
+
     // 初始试飞 PID 建议参数 (稳妥起见，降低了 P，增加了 D)
     PIDController pid_roll(1.2f, 0.0f, 0.6f, 50.0f);
     PIDController pid_pitch(1.2f, 0.0f, 0.6f, 50.0f);
     PIDController pid_yaw(2.0f, 0.0f, 0.0f, 50.0f);
     
-    // 🌟 新增：Z轴高度 PID 控制器 (用于定高)
+    // Z轴高度 PID 控制器 (用于定高)
     PIDController pid_alt(20.0f, 0.0f, 15.0f, 100.0f); 
 
-    // 🌟 新增：定高与失控保护的状态变量
+    // 定高与失控保护的状态变量
     bool is_alt_hold = false;
     float hover_throttle = 0.0f;
     float target_alt = 0.0f;
@@ -72,9 +84,12 @@ int main() {
     std::cout << ">>> 硬件底层就绪！等待遥控器 SWA (CH5) 拨下以唤醒飞控..." << std::endl;
     flightLed.setYellow(); // 黄灯常亮代表“通电待机中”
 
+    // 洗胃操作：暴力排空开机 15 秒内积压的几万个无效串口数据包，确保零延迟
+    for (int i = 0; i < 10000; i++) receiver.update(); 
+
     while (true) {
         // 清空串口积压并读取最新通道数据
-        for (int i = 0; i < 3; i++) receiver.update(); 
+        for (int i = 0; i < 50; i++) receiver.update(); 
         uint16_t rx_arm_switch = receiver.get_channel(5);
 
         // 如果侦测到 SWA 拨杆被拨下 (富斯遥控器拨下通常输出 2000)
@@ -120,10 +135,11 @@ int main() {
     auto next_loop_time = std::chrono::steady_clock::now();
     bool is_crashed = false;
     float estimated_yaw = 0.0f, target_yaw = 0.0f; 
+    float flight_time = 0.0f; // 飞行时间累计 (用于黑匣子)
 
     while (true) {
         next_loop_time += std::chrono::milliseconds(10);
-
+        flight_time += LOOP_TIME_SEC;
         
         // ==========================================
         // 读取气压计数据 (需放在前面以供 PID 使用)
@@ -132,7 +148,7 @@ int main() {
         // ==========================================
 
         // 连读排空缓冲区，消除延迟
-        for (int i = 0; i < 3; i++) receiver.update(); 
+        for (int i = 0; i < 50; i++) receiver.update(); 
         
         // 【通道映射】严格按照日本手 Mode 1 设定
         uint16_t rx_roll     = receiver.get_channel(1); // CH1: 右手左右
@@ -143,15 +159,15 @@ int main() {
 
         bool is_armed = (rx_arm_switch > 1500); 
 
-        // 摇杆死区过滤
-        const uint16_t DEADBAND = 15;
-        if (rx_roll > 1500 - DEADBAND && rx_roll < 1500 + DEADBAND) rx_roll = 1500;
-        if (rx_pitch > 1500 - DEADBAND && rx_pitch < 1500 + DEADBAND) rx_pitch = 1500;
-        if (rx_yaw > 1500 - DEADBAND && rx_yaw < 1500 + DEADBAND) rx_yaw = 1500;
+        // 🌟 核心修正：接入 RCMath 库处理死区和摇杆 Expo 曲线
+        float raw_roll  = (rx_roll - 1500) / 500.0f;
+        float raw_pitch = (rx_pitch - 1500) / 500.0f;
+        float raw_yaw   = (rx_yaw - 1500) / 500.0f;
 
-        float stick_roll  = (rx_roll - 1500) / 500.0f;
-        float stick_pitch = (rx_pitch - 1500) / 500.0f;
-        float stick_yaw   = (rx_yaw - 1500) / 500.0f;
+        // 设定 5% 的死区 (0.05f)，以及 60% 的曲线弯折率 (0.6f)
+        float stick_roll  = RCMath::process_channel(raw_roll, 0.05f, 0.6f);
+        float stick_pitch = RCMath::process_channel(raw_pitch, 0.05f, 0.6f);
+        float stick_yaw   = RCMath::process_channel(raw_yaw, 0.05f, 0.6f);
         float base_throttle = (rx_throttle > 1030) ? (rx_throttle - 1000.0f) : 0.0f;
 
         // 传感器读取与姿态解算
@@ -173,24 +189,22 @@ int main() {
         float estimated_pitch = kalman_pitch.get_angle(accel_pitch, gyro_y, LOOP_TIME_SEC);
         estimated_yaw += gyro_z * LOOP_TIME_SEC; 
 
-        // 🌟 核心修正：真正的失控保护 (Failsafe)
-        // 正常最低油门是 1000。只有遥控器关机、信号丢失或接收机断线时，值才会跌至 950 以下。
+        // 失控保护 (Failsafe)
         bool is_failsafe = (rx_throttle < 950);
 
-        // 🌟 核心 2：定高悬停 (Altitude Hold) 逻辑
+        // 定高悬停 (Altitude Hold) 逻辑
         float pid_out_alt = 0.0f;
-        // 设定油门中位死区 (1450~1550)。如果你把右手摇杆放在中间，飞机自动接管高度！
         if (rx_throttle > 1450 && rx_throttle < 1550 && is_armed && base_throttle > 100.0f) {
             if (!is_alt_hold) {
                 target_alt = alt; // 瞬间锁定当前气压高度
-                hover_throttle = base_throttle; // 锁定你当前的物理推力
+                hover_throttle = base_throttle; // 锁定当前的物理推力
                 is_alt_hold = true;
             }
             pid_out_alt = pid_alt.update(target_alt, alt, LOOP_TIME_SEC);
             base_throttle = hover_throttle + pid_out_alt; // PID 接管油门
         } else {
             is_alt_hold = false;
-            pid_alt.reset(); // 退出定高时，清空历史误差积分
+            pid_alt.reset(); 
         }
 
         float target_roll = stick_roll * 30.0f;
@@ -207,37 +221,36 @@ int main() {
         float pid_out_pitch = pid_pitch.update(target_pitch, estimated_pitch, LOOP_TIME_SEC);
         float pid_out_yaw   = pid_yaw.update(target_yaw, estimated_yaw, LOOP_TIME_SEC);
 
-        // 🌟 核心修正：加入容错防抖，过滤 I2C 噪声导致的“瞬间假坠机”
+        // 容错防抖，过滤 I2C 噪声导致的“瞬间假坠机”
         static int crash_counter = 0;
         if (std::abs(estimated_roll) > 75.0f || std::abs(estimated_pitch) > 75.0f) {
             crash_counter++;
-            if (crash_counter > 25) { // 必须连续 0.25 秒(25帧)超过 75 度，才判定为物理坠机！
+            if (crash_counter > 25) { 
                 is_crashed = true;
             }
         } else {
-            crash_counter = 0; // 一旦恢复正常姿态，计数器立刻清零，化险为夷
+            crash_counter = 0; 
         }
         
-        // 🚨 优先级 0：失控保护 (最高绝对指令)
+        // 🌟 核心修正：统一计算最终 PWM，方便记录黑匣子
+        uint16_t final_pwm1 = 1000, final_pwm2 = 1000, final_pwm3 = 1000, final_pwm4 = 1000;
+
+        // 🚨 优先级 0：失控保护
         if (is_failsafe) {
-            flightLed.setRed(); // 红灯长亮代表失控
-            // TODO: 未来可在此处实现 "缓慢迫降" 逻辑。当前为了安全，直接停转。
-            esc1.setThrottle(1000); esc2.setThrottle(1000);
-            esc3.setThrottle(1000); esc4.setThrottle(1000);
+            flightLed.setRed();
+            // 维持 1000
         }
         // 🚨 优先级 1：坠机锁死
         else if (is_crashed) {
             flightLed.setRed();      
-            esc1.setThrottle(1000); esc2.setThrottle(1000);
-            esc3.setThrottle(1000); esc4.setThrottle(1000);
+            // 维持 1000
         } 
         // 🔵 优先级 2：安全上锁 / 怠速防误触
         else if (!is_armed || base_throttle < 10.0f) {
             flightLed.setBlue();     
-            esc1.setThrottle(1000); esc2.setThrottle(1000);
-            esc3.setThrottle(1000); esc4.setThrottle(1000);
+            // 维持 1000
         } 
-        // 🟢 优先级 3：正常战斗飞行 (激活外旋混控)
+        // 🟢 优先级 3：正常战斗飞行
         else {
             flightLed.setGreen(); 
             float out1 = 1000.0f + base_throttle - pid_out_pitch + pid_out_roll + pid_out_yaw;
@@ -251,13 +264,23 @@ int main() {
                 return static_cast<uint16_t>(out);
             };
 
-            esc1.setThrottle(clamp_pwm(out1));
-            esc2.setThrottle(clamp_pwm(out2));
-            esc3.setThrottle(clamp_pwm(out3));
-            esc4.setThrottle(clamp_pwm(out4));
+            final_pwm1 = clamp_pwm(out1);
+            final_pwm2 = clamp_pwm(out2);
+            final_pwm3 = clamp_pwm(out3);
+            final_pwm4 = clamp_pwm(out4);
         }
 
-        // 📝 默认状态输出 (每 0.1 秒刷新一次，干净、专业)
+        // 最终将计算好的 PWM 统一喂给电机
+        esc1.setThrottle(final_pwm1);
+        esc2.setThrottle(final_pwm2);
+        esc3.setThrottle(final_pwm3);
+        esc4.setThrottle(final_pwm4);
+
+        // 🌟 将本次循环的所有核心数据打包刷入 SD 卡黑匣子
+        flight_logger.log_frame(flight_time, estimated_pitch, estimated_roll, estimated_yaw, alt, 
+                                final_pwm1, final_pwm2, final_pwm3, final_pwm4);
+
+        // 📝 默认状态输出 
         static int count = 0;
         if (count++ % 10 == 0) { 
             std::cout << (is_failsafe ? "[⚠️ 失控]" : (is_crashed ? "[❌ 坠机]" : (is_armed ? "[🚀 战斗]" : "[🔒 安全]")))
