@@ -280,15 +280,18 @@ int main() {
         flight_logger.log_frame(flight_time, estimated_pitch, estimated_roll, estimated_yaw, alt, 
                                 final_pwm1, final_pwm2, final_pwm3, final_pwm4);
 
-        // 📝 默认状态输出 
+        // 📝 核心参数遥测输出 (每 0.5 秒 / 50帧 刷新一次，保持日志清晰且不刷屏)
         static int count = 0;
-        if (count++ % 10 == 0) { 
-            std::cout << (is_failsafe ? "[⚠️ 失控]" : (is_crashed ? "[❌ 坠机]" : (is_armed ? "[🚀 战斗]" : "[🔒 安全]")))
-                      << (is_alt_hold ? " [定高 ON] " : " [定高 OFF]")
-                      << " 油门: " << (int)base_throttle 
-                      << " | 高度: " << alt << "m"
-                      << " | 倾角(R/P): " << (int)estimated_roll << "°," << (int)estimated_pitch << "°" 
-                      << std::endl;
+        if (count++ % 50 == 0) { 
+            std::cout << "\n================ 📊 飞控实时数据看板 ================\n"
+                      << "🛡️ [系统状态]: " << (is_failsafe ? "⚠️ 失控 (Failsafe)" : (is_crashed ? "❌ 坠机锁死 (Crashed)" : (is_armed ? "🚀 战斗 (已解锁)" : "🔒 安全 (未解锁)")))
+                      << (is_alt_hold ? " | ☁️ 定高模式: ON" : " | ☁️ 定高模式: OFF") << "\n"
+                      << "🕹️ [油门信号]: 遥控器原始(CH3) = " << rx_throttle << " | 运算净推力 = " << (int)base_throttle << "\n"
+                      << "✈️ [无人机姿态]: 横滚(Roll) = " << (int)estimated_roll << "° | 俯仰(Pitch) = " << (int)estimated_pitch << "° | 偏航(Yaw) = " << (int)estimated_yaw << "°\n"
+                      << "🌪️ [气压与高度]: 气压值 = " << press << " Pa | 相对高度 = " << alt << " m\n"
+                      << "⚡ [电调PWM输出]: M1(左前) = " << final_pwm1 << " | M2(右前) = " << final_pwm2 << " | M3(左后) = " << final_pwm3 << " | M4(右后) = " << final_pwm4 << "\n"
+                      << "========================================================\n"
+                      << std::flush;
         }
 
         std::this_thread::sleep_until(next_loop_time);
